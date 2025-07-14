@@ -1,6 +1,6 @@
 import { Request, Response } from 'express';
 import { reviewCodeWithAI } from '../services';
-import { getPromptTemplate } from '../prompts';
+import { getPromptTemplate, PROMPT_TEMPLATES } from '../prompts';
 import { logMemoryUsage, forceGarbageCollection, checkMemoryThreshold } from '../utils/memoryMonitor';
 import type { ReviewRequestType } from '../types';
 
@@ -101,7 +101,7 @@ export const testOpenAI = async (req: Request, res: Response) => {
 // Endpoint to list available prompt templates
 export const listPromptTemplates = async (req: Request, res: Response) => {
   try {
-    const templates = ['professional', 'security', 'performance', 'cleanCode'].map((name) => {
+    const templates = Object.keys(PROMPT_TEMPLATES).map((name) => {
       const template = getPromptTemplate(name);
       return {
         name: template.name,
