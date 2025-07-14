@@ -1,15 +1,18 @@
 import { Request, Response } from 'express';
-import {
-  verifyWebhookSignature,
-  hasBotReviewed,
-  getPRDiff,
-  getPRDetails,
-  postReviewComments,
-  getRepositoryInstallation,
-  reviewCodeWithAI,
-} from '../services';
+// import {
+//   verifyWebhookSignature,
+//   hasBotReviewed,
+//   getPRDiff,
+//   getPRDetails,
+//   postReviewComments,
+//   getRepositoryInstallation,
+//   reviewCodeWithAI,
+// } from '../services';
+import { GitHubService, reviewCodeWithAI } from '../services';
 import type { GitHubWebhookEventType, GitHubCommentType, GitHubAppConfigType } from '../types';
+import { getGitHubConfig } from '../config';
 
+const githubService = new GitHubService(getGitHubConfig());
 // Handler for GitHub webhook events
 export const handleWebhook =
   (config: GitHubAppConfigType, botUsername: string) => async (req: Request, res: Response) => {
@@ -19,7 +22,7 @@ export const handleWebhook =
       const payload = JSON.stringify(req.body);
 
       // Verify webhook signature
-      if (!verifyWebhookSignature(payload, signature, config)) {
+      if (!githubService.verifyWebhookSignature(payload, signature)) {
         console.error('Invalid webhook signature');
         res.status(401).json({ error: 'Invalid signature' });
         return;
@@ -30,7 +33,7 @@ export const handleWebhook =
       // Handle different event types
       switch (event) {
         case 'pull_request':
-          await handlePullRequestEvent(req.body as GitHubWebhookEventType, config, botUsername);
+          await handlePullRequestEvent(req.body as GitHubWebhookEventType, botUsername, res);
           break;
         case 'pull_request_review':
           await handlePullRequestReviewEvent(req.body as GitHubWebhookEventType);
@@ -39,7 +42,10 @@ export const handleWebhook =
           console.log(`Unhandled event type: ${event}`);
       }
 
-      res.status(200).json({ status: 'ok' });
+      // Only send 200 if not already sent
+      if (!res.headersSent) {
+        res.status(200).json({ status: 'ok' });
+      }
     } catch (error) {
       console.error('Error handling webhook:', error);
       res.status(500).json({ error: 'Internal server error' });
@@ -49,8 +55,8 @@ export const handleWebhook =
 // Handle pull request events
 export const handlePullRequestEvent = async (
   event: GitHubWebhookEventType,
-  config: GitHubAppConfigType,
   botUsername: string,
+  res?: Response,
 ): Promise<void> => {
   const { action, pull_request, repository, installation } = event;
 
@@ -62,19 +68,21 @@ export const handlePullRequestEvent = async (
 
   if (!installation?.id) {
     console.error('No installation ID found in webhook payload');
+    if (res) res.status(400).json({ error: 'No installation ID found in webhook payload' });
     return;
   }
 
   const { owner, name: repo } = repository;
   const pullNumber = pull_request.number;
 
-  console.log(`Processing PR #${pullNumber} in ${owner}/${repo}`);
+  console.log(`Processing PR #${pullNumber} in ${owner.login}/${repo}`);
 
   try {
     // Check if bot has already reviewed this PR
-    const hasReviewed = await hasBotReviewed(owner.login, repo, pullNumber, installation.id, config, botUsername);
+    const hasReviewed = await githubService.hasBotReviewed(owner.login, repo, pullNumber, installation.id, botUsername);
     if (hasReviewed) {
       console.log(`Bot has already reviewed PR #${pullNumber}`);
+      if (res) res.status(200).json({ message: 'Bot has already reviewed this PR' });
       return;
     }
 
@@ -82,24 +90,40 @@ export const handlePullRequestEvent = async (
     const headSha = pull_request.head.sha;
 
     // Fetch PR diff
-    const diff = await getPRDiff(owner.login, repo, pullNumber, installation.id, config);
+    let diff: string;
+    try {
+      diff = await githubService.getPRDiff(owner.login, repo, pullNumber, installation.id);
+    } catch (err: any) {
+      console.error(`Error fetching PR diff for #${pullNumber}:`, err);
+      if (res) res.status(500).json({ error: 'Failed to fetch PR diff', details: err.message });
+      return;
+    }
     if (!diff || diff.trim().length === 0) {
       console.log(`No diff found for PR #${pullNumber}`);
+      if (res) res.status(404).json({ error: 'No diff found for this PR' });
       return;
     }
 
     // Process with AI
-    const aiResponse = await reviewCodeWithAI({
-      diff,
-      promptConfig: {
-        template: 'professional',
-        tone: 'professional',
-        focus: 'general',
-        detail: 'detailed',
-      },
-    });
+    let aiResponse;
+    try {
+      aiResponse = await reviewCodeWithAI({
+        diff,
+        promptConfig: {
+          template: 'professional',
+          tone: 'professional',
+          focus: 'general',
+          detail: 'detailed',
+        },
+      });
+    } catch (err: any) {
+      console.error(`AI review failed for PR #${pullNumber}:`, err);
+      if (res) res.status(500).json({ error: 'AI review failed', details: err.message });
+      return;
+    }
     if (!aiResponse.comments || aiResponse.comments.length === 0) {
       console.log(`No AI comments generated for PR #${pullNumber}`);
+      if (res) res.status(200).json({ message: 'No AI comments generated for this PR' });
       return;
     }
 
@@ -107,21 +131,28 @@ export const handlePullRequestEvent = async (
     const githubComments = convertToGitHubComments(aiResponse.comments, diff, headSha);
 
     // Post review comments
-    await postReviewComments(
-      {
-        owner: owner.login,
-        repo,
-        pull_number: pullNumber,
-        event: 'COMMENT',
-        body: `🤖 AI Code Review\n\n${aiResponse.comments.length} comments generated.`,
-        comments: githubComments,
-      },
-      installation.id,
-      config,
-    );
-    console.log(`Successfully posted ${githubComments.length} comments to PR #${pullNumber}`);
-  } catch (error) {
+    try {
+      await githubService.postReviewComments(
+        {
+          owner: owner.login,
+          repo,
+          pull_number: pullNumber,
+          event: 'COMMENT',
+          body: `🤖 AI Code Review\n\n${aiResponse.comments.length} comments generated.`,
+          comments: githubComments,
+        },
+        installation.id,
+      );
+      console.log(`Successfully posted ${githubComments.length} comments to PR #${pullNumber}`);
+      if (res)
+        res.status(200).json({ message: `Successfully posted ${githubComments.length} comments to PR #${pullNumber}` });
+    } catch (err: any) {
+      console.error(`Error posting review comments for PR #${pullNumber}:`, err);
+      if (res) res.status(500).json({ error: 'Failed to post review comments', details: err.message });
+    }
+  } catch (error: any) {
     console.error(`Error processing PR #${pullNumber}:`, error);
+    if (res) res.status(500).json({ error: 'Internal server error', details: error.message });
   }
 };
 
@@ -172,7 +203,14 @@ export const manualReview =
 
       console.log('Getting installation ID for:', owner, repo);
       // Get installation ID for the repository
-      const installationId = await getRepositoryInstallation(owner, repo, config);
+      let installationId: number | null;
+      try {
+        installationId = await githubService.getRepositoryInstallation(owner, repo);
+      } catch (err: any) {
+        console.error('Error getting installation ID:', err);
+        res.status(500).json({ error: 'Failed to get installation ID', details: err.message });
+        return;
+      }
       if (!installationId) {
         console.log('No installation found for:', owner, repo);
         res.status(404).json({ error: 'GitHub App not installed on this repository' });
@@ -182,13 +220,27 @@ export const manualReview =
 
       console.log('Fetching PR details...');
       // Fetch PR details to get head SHA
-      const prDetails = await getPRDetails(owner, repo, pullNumber, installationId, config);
+      let prDetails: any;
+      try {
+        prDetails = await githubService.getPRDetails(owner, repo, pullNumber, installationId);
+      } catch (err: any) {
+        console.error('Error fetching PR details:', err);
+        res.status(500).json({ error: 'Failed to fetch PR details', details: err.message });
+        return;
+      }
       const headSha = prDetails.head.sha;
       console.log('Head SHA:', headSha);
 
       console.log('Fetching PR diff...');
       // Fetch PR diff
-      const diff = await getPRDiff(owner, repo, pullNumber, installationId, config);
+      let diff: string;
+      try {
+        diff = await githubService.getPRDiff(owner, repo, pullNumber, installationId);
+      } catch (err: any) {
+        console.error('Error fetching PR diff:', err);
+        res.status(500).json({ error: 'Failed to fetch PR diff', details: err.message });
+        return;
+      }
       if (!diff || diff.trim().length === 0) {
         console.log('No diff found for PR');
         res.status(404).json({ error: 'No diff found for this PR' });
@@ -198,15 +250,22 @@ export const manualReview =
 
       console.log('Processing with AI...');
       // Process with AI
-      const aiResponse = await reviewCodeWithAI({
-        diff,
-        promptConfig: {
-          template: 'professional',
-          tone: 'professional',
-          focus: 'general',
-          detail: 'detailed',
-        },
-      });
+      let aiResponse;
+      try {
+        aiResponse = await reviewCodeWithAI({
+          diff,
+          promptConfig: {
+            template: 'professional',
+            tone: 'professional',
+            focus: 'general',
+            detail: 'detailed',
+          },
+        });
+      } catch (err: any) {
+        console.error('AI review failed:', err);
+        res.status(500).json({ error: 'AI review failed', details: err.message });
+        return;
+      }
       console.log('AI response received, comments:', aiResponse.comments?.length || 0);
 
       // For now, let's just post a general review comment without line-specific comments
@@ -218,19 +277,24 @@ export const manualReview =
         error: '❌',
         info: 'ℹ️',
       };
-      await postReviewComments(
-        {
-          owner,
-          repo,
-          pull_number: pullNumber,
-          event: 'COMMENT',
-          body: `🤖 AI Code Reviewer\n\n${aiResponse.comments.length} comments generated:\n\n${aiResponse.comments.map((comment, index) => `${index + 1}. \`${comment.fileName || 'N/A'}\` - \`Line: ${comment.lineNumber || 'N/A'}\` \`${typeEmoji[comment.type as keyof typeof typeEmoji]} ${(comment.type || 'suggestion').toUpperCase()}\`\n    ${comment.content}`).join('\n\n')}`,
-          comments: [], // Empty comments array to avoid positioning issues
-        },
-        installationId,
-        config,
-      );
-      console.log('General review comment posted successfully');
+      try {
+        await githubService.postReviewComments(
+          {
+            owner,
+            repo,
+            pull_number: pullNumber,
+            event: 'COMMENT',
+            body: `🤖 AI Code Reviewer\n\n${aiResponse.comments.length} comments generated:\n\n${aiResponse.comments.map((comment, index) => `${index + 1}. \`${comment.fileName || 'N/A'}\` - \`Line: ${comment.lineNumber || 'N/A'}\` \`${typeEmoji[comment.type as keyof typeof typeEmoji]} ${(comment.type || 'suggestion').toUpperCase()}\`\n    ${comment.content}`).join('\n\n')}`,
+            comments: [], // Empty comments array to avoid positioning issues
+          },
+          installationId,
+        );
+        console.log('General review comment posted successfully');
+      } catch (err: any) {
+        console.error('Error posting review comments:', err);
+        res.status(500).json({ error: 'Failed to post review comments', details: err.message });
+        return;
+      }
 
       res.json({
         success: true,
@@ -239,7 +303,6 @@ export const manualReview =
       });
     } catch (error: any) {
       console.error('Error in manual review:', error);
-      console.error('Error stack:', error.stack);
       res.status(500).json({
         error: 'Internal server error',
         details: error.message,
