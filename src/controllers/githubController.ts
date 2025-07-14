@@ -1,15 +1,18 @@
 import { Request, Response } from 'express';
-import {
-  verifyWebhookSignature,
-  hasBotReviewed,
-  getPRDiff,
-  getPRDetails,
-  postReviewComments,
-  getRepositoryInstallation,
-  reviewCodeWithAI,
-} from '../services';
+// import {
+//   verifyWebhookSignature,
+//   hasBotReviewed,
+//   getPRDiff,
+//   getPRDetails,
+//   postReviewComments,
+//   getRepositoryInstallation,
+//   reviewCodeWithAI,
+// } from '../services';
+import { GitHubService, reviewCodeWithAI } from '../services';
 import type { GitHubWebhookEventType, GitHubCommentType, GitHubAppConfigType } from '../types';
+import { getGitHubConfig } from '../config';
 
+const githubService = new GitHubService(getGitHubConfig());
 // Handler for GitHub webhook events
 export const handleWebhook =
   (config: GitHubAppConfigType, botUsername: string) => async (req: Request, res: Response) => {
@@ -19,7 +22,7 @@ export const handleWebhook =
       const payload = JSON.stringify(req.body);
 
       // Verify webhook signature
-      if (!verifyWebhookSignature(payload, signature, config)) {
+      if (!githubService.verifyWebhookSignature(payload, signature, config)) {
         console.error('Invalid webhook signature');
         res.status(401).json({ error: 'Invalid signature' });
         return;
@@ -72,7 +75,7 @@ export const handlePullRequestEvent = async (
 
   try {
     // Check if bot has already reviewed this PR
-    const hasReviewed = await hasBotReviewed(owner.login, repo, pullNumber, installation.id, config, botUsername);
+    const hasReviewed = await githubService.hasBotReviewed(owner.login, repo, pullNumber, installation.id, botUsername);
     if (hasReviewed) {
       console.log(`Bot has already reviewed PR #${pullNumber}`);
       return;
@@ -82,7 +85,7 @@ export const handlePullRequestEvent = async (
     const headSha = pull_request.head.sha;
 
     // Fetch PR diff
-    const diff = await getPRDiff(owner.login, repo, pullNumber, installation.id, config);
+    const diff = await githubService.getPRDiff(owner.login, repo, pullNumber, installation.id, config);
     if (!diff || diff.trim().length === 0) {
       console.log(`No diff found for PR #${pullNumber}`);
       return;
@@ -107,7 +110,7 @@ export const handlePullRequestEvent = async (
     const githubComments = convertToGitHubComments(aiResponse.comments, diff, headSha);
 
     // Post review comments
-    await postReviewComments(
+    await githubService.postReviewComments(
       {
         owner: owner.login,
         repo,
